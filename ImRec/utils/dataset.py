@@ -1,337 +1,365 @@
 # coding: utf-8
 
 """
-Data pre-processing
-##########################
+Wrap dataset into dataloader
+################################################
 """
-from logging import getLogger
-from collections import Counter
-import os, copy
-import pandas as pd
+import math
+import torch
+import random
 import numpy as np
-import time
-#from torch.utils.data import Dataset
+from logging import getLogger
+from utils.enum_type import ModelType
+from scipy.sparse import coo_matrix
 
 
-class RecDataset(object):
-    def __init__(self, config, df=None):
+class AbstractDataLoader(object):
+    """:class:`AbstractDataLoader` is an abstract object which would return a batch of data
+    And it is also the ancestor of all other dataloader.
+
+    Args:
+        config (Config): The config of dataloader.
+        dataset (Dataset): The dataset of dataloader.
+        batch_size (int, optional): The batch_size of dataloader. Defaults to ``1``.
+        dl_format (InputType, optional): The input type of dataloader.
+        shuffle (bool, optional): Whether the dataloader will be shuffle after a round. Defaults to ``False``.
+
+    Attributes:
+        dataset (Dataset): The dataset of this dataloader.
+        shuffle (bool): If ``True``, dataloader will shuffle before every epoch.
+        real_time (bool): If ``True``, dataloader will do data pre-processing,
+            such as neg-sampling and data-augmentation.
+        pr (int): Pointer of dataloader.
+        step (int): The increment of :attr:`pr` for each batch.
+        batch_size (int): The max interaction number for all batch.
+    """
+    def __init__(self, config, dataset, additional_dataset=None,
+                 batch_size=1, neg_sampling=False, shuffle=False):
         self.config = config
-        self.dataset_path = os.path.abspath(config['data_path'])
-        self.preprocessed_dataset_path = os.path.abspath(config['preprocessed_data'])
-        self.preprocessed_loaded = False        # if preprocessed data loaded?
         self.logger = getLogger()
-        self.dataset_name = config['dataset']
+        self.dataset = dataset
+        self.dataset_bk = self.dataset.copy(self.dataset.df)
+        # if config['model_type'] == ModelType.GENERAL:
+        #     self.dataset.df.drop(self.dataset.ts_id, inplace=True, axis=1)
+        # elif config['model_type'] == ModelType.SEQUENTIAL:
+        #     # sort instances
+        #     pass
+        self.additional_dataset = additional_dataset
+        self.batch_size = batch_size
+        self.step = batch_size
+        self.shuffle = shuffle
+        self.neg_sampling = neg_sampling
+        self.device = config['device']
 
-        # dataframe
-        self.uid_field = self.config['USER_ID_FIELD']
-        self.iid_field = self.config['ITEM_ID_FIELD']
-        self.ts_id = self.config['TIME_FIELD']
+        self.sparsity = 1 - self.dataset.inter_num / self.dataset.user_num / self.dataset.item_num
+        self.pr = 0
+        self.inter_pr = 0
 
-        if df is not None:
-            self.df = df
-            return
-        self.ui_core_splitting_str = self._k_core_and_splitting()
-        self.processed_data_name = '{}_{}_processed.inter'.format(self.dataset_name, self.ui_core_splitting_str)
-        # load from preprocessed path?
-        if self.config['load_preprocessed'] and self._load_preprocessed_dataset():
-            self.preprocessed_loaded = True
-            self.logger.info('\nData loaded from preprocessed dir: ' + self.preprocessed_dataset_path + '\n')
-            return
-        # load dataframe
-        self._from_scratch()
-        # pre-processing
-        self._data_processing()
-
-    def _k_core_and_splitting(self):
-        user_min_n = 1
-        item_min_n = 1
-        if self.config['min_user_inter_num'] is not None:
-            user_min_n = max(self.config['min_user_inter_num'], 1)
-        if self.config['min_item_inter_num'] is not None:
-            item_min_n = max(self.config['min_item_inter_num'], 1)
-        # splitting
-        ratios = self.config['split_ratio']
-        tot_ratio = sum(ratios)
-        # remove 0.0 in ratios
-        ratios = [i for i in ratios if i > .0]
-        ratios = [str(int(_ * 10 / tot_ratio)) for _ in ratios]
-        s = ''.join(ratios)
-        return 'u{}i{}_s'.format(user_min_n, item_min_n) + s
-
-    def _load_preprocessed_dataset(self):
-        file_path = os.path.join(self.preprocessed_dataset_path, self.processed_data_name)
-        if not os.path.isfile(file_path):
-            return False
-        # load
-        self.df = self._load_df_from_file(file_path, self.config['load_cols']+[self.config['preprocessed_data_splitting']])
-        return True
-
-    def _from_scratch(self):
-        """Load dataset from scratch.
-        Initialize attributes firstly, then load data from atomic files, pre-process the dataset lastly.
+    def pretrain_setup(self):
+        """This function can be used to deal with some problems after essential args are initialized,
+        such as the batch-size-adaptation when neg-sampling is needed, and so on. By default, it will do nothing.
         """
-        self.logger.info('Loading {} from scratch'.format(self.__class__))
-        # get path
-        file_path = os.path.join(self.dataset_path, '{}.inter'.format(self.dataset_name))
-        if not os.path.isfile(file_path):
-            raise ValueError('File {} not exist'.format(file_path))
-        self.df = self._load_df_from_file(file_path, self.config['load_cols'])
+        pass
 
-    def _load_df_from_file(self, file_path, load_columns):
-        # read header(user_id:token   item_id:token   rating:float    timestamp:float) for ml-10k
-        cnt = 0
-        with open(file_path, 'r') as f:
-            head = f.readline()[:-1]
-            field_separator = self.config['field_separator']
-            # only use [user_id, item_id, timestamp]
-            for field_type in head.split(field_separator):
-                if field_type in load_columns:
-                    cnt += 1
-            # all cols exist
-            if cnt != len(load_columns):
-                raise ValueError('File {} lost some required columns.'.format(file_path))
-
-        df = pd.read_csv(file_path, sep=self.config['field_separator'], usecols=load_columns)
-        return df
-
-    def _data_processing(self):
-        """Data preprocessing, including:
-        - K-core data filtering
-        - Remap ID
+    def data_preprocess(self):
+        """This function is used to do some data preprocess, such as pre-neg-sampling and pre-data-augmentation.
+        By default, it will do nothing.
         """
-        # drop N/A value
-        self.df.dropna(inplace=True)
-        # remove duplicate rows
-        self.df.drop_duplicates(inplace=True)
-        # perform k-core
-        self._filter_by_k_core(self.df)
-        # remap ID
-        self._reset_index(self.df)
-
-    def _filter_by_k_core(self, df):
-        """Filter by number of interaction.
-
-        Upper/Lower bounds can be set, only users/items between upper/lower bounds can be remained.
-        See :doc:`../user_guide/data/data_args` for detail arg setting.
-
-        Note:
-            Lower bound is also called k-core filtering, which means this method will filter loops
-            until all the users and items has at least k interactions.
-        """
-        while True:
-            ban_users = self._get_illegal_ids_by_inter_num(df, field=self.uid_field,
-                                                           max_num=self.config['max_user_inter_num'],
-                                                           min_num=self.config['min_user_inter_num'])
-            ban_items = self._get_illegal_ids_by_inter_num(df, field=self.iid_field,
-                                                           max_num=self.config['max_item_inter_num'],
-                                                           min_num=self.config['min_item_inter_num'])
-
-            if len(ban_users) == 0 and len(ban_items) == 0:
-                return
-
-            dropped_inter = pd.Series(False, index=df.index)
-            if self.uid_field:
-                dropped_inter |= df[self.uid_field].isin(ban_users)
-            if self.iid_field:
-                dropped_inter |= df[self.iid_field].isin(ban_items)
-            # self.logger.info('[{}] dropped interactions'.format(len(dropped_inter)))
-            df.drop(df.index[dropped_inter], inplace=True)
-
-    def _get_illegal_ids_by_inter_num(self, df, field, max_num=None, min_num=None):
-        """Given inter feat, return illegal ids, whose inter num out of [min_num, max_num]
-
-        Args:
-            field (str): field name of user_id or item_id.
-            feat (pandas.DataFrame): interaction feature.
-            max_num (int, optional): max number of interaction. Defaults to ``None``.
-            min_num (int, optional): min number of interaction. Defaults to ``None``.
-
-        Returns:
-            set: illegal ids, whose inter num out of [min_num, max_num]
-        """
-        self.logger.debug('\n get_illegal_ids_by_inter_num:\n\t field=[{}], max_num=[{}], min_num=[{}]'.format(
-            field, max_num, min_num
-        ))
-
-        if field is None:
-            return set()
-        if max_num is None and min_num is None:
-            return set()
-
-        max_num = max_num or np.inf
-        min_num = min_num or -1
-
-        ids = df[field].values
-        inter_num = Counter(ids)
-        ids = {id_ for id_ in inter_num if inter_num[id_] < min_num or inter_num[id_] > max_num}
-
-        self.logger.debug('[{}] illegal_ids_by_inter_num, field=[{}]'.format(len(ids), field))
-        return ids
-
-    def _reset_index(self, df):
-        if df.empty:
-            raise ValueError('Some feat is empty, please check the filtering settings.')
-        df.reset_index(drop=True, inplace=True)
-
-    def split(self, ratios):
-        """Split interaction records by ratios.
-
-        Args:
-            ratios (list): List of split ratios. No need to be normalized.
-            group_by (str, optional): Field name that interaction records should grouped by after splitting.
-                Defaults to ``None``
-
-        Returns:
-            list: List of :class:`~Dataset`, whose interaction features has been splitted.
-
-        Note:
-            Other than the first one, each part is rounded down.
-        """
-        if self.preprocessed_loaded:
-            dfs = []
-            splitting_label = self.config['preprocessed_data_splitting']
-            # splitting into training/validation/test
-            for i in range(3):
-                temp_df = self.df[self.df[splitting_label] == i].copy()
-                temp_df.drop(splitting_label, inplace=True, axis=1)
-                dfs.append(temp_df)
-            # wrap as RecDataset
-            full_ds = [self.copy(_) for _ in dfs]
-            return full_ds
-
-        tot_ratio = sum(ratios)
-        # remove 0.0 in ratios
-        ratios = [i for i in ratios if i > .0]
-        ratios = [_ / tot_ratio for _ in ratios]
-
-        # get split global time
-        split_ratios = np.cumsum(ratios)[:-1]
-        split_timestamps = list(np.quantile(self.df[self.ts_id], split_ratios))
-
-        # get df training dataset unique users/items
-        df_train = self.df.loc[self.df[self.ts_id] < split_timestamps[0]]
-        self.logger.info('==Splitting: 1. Reindexing and filtering out new users/items not in train dataset...')
-
-        uni_users = pd.unique(df_train[self.uid_field])
-        uni_items = pd.unique(df_train[self.iid_field])
-        # re_index users & items
-        u_id_map = {k: i for i, k in enumerate(uni_users)}
-        i_id_map = {k: i for i, k in enumerate(uni_items)}
-        self.df[self.uid_field] = self.df[self.uid_field].map(u_id_map)
-        self.df[self.iid_field] = self.df[self.iid_field].map(i_id_map)
-        # filter out Nan line
-        self.df.dropna(inplace=True)
-        # as int
-        self.df = self.df.astype(int)
-
-        # split df based on global time
-        self.logger.info('==Splitting: 2. Train/Valid/Test.')
-        dfs = []
-        start = 0
-        for i in split_timestamps:
-            dfs.append(self.df.loc[(start <= self.df[self.ts_id]) & (self.df[self.ts_id] < i)].copy())
-            start = i
-        # last
-        dfs.append(self.df.loc[start <= self.df[self.ts_id]].copy())
-
-        # save to disk
-        self.logger.info('==Splitting: 3. Dumping...')
-        self._save_dfs_to_disk(u_id_map, i_id_map, dfs)
-        # self._drop_cols(dfs+[self.df], [self.ts_id])
-
-        # wrap as RecDataset
-        full_ds = [self.copy(_) for _ in dfs]
-        return full_ds
-
-    def _save_dfs_to_disk(self, u_map, i_map, dfs):
-        if self.config['load_preprocessed'] and not self.preprocessed_loaded:
-            dir_name = self.preprocessed_dataset_path
-            if not os.path.exists(dir_name):
-                os.makedirs(dir_name)
-            # save id mapping
-            u_df = pd.DataFrame(list(u_map.items()), columns=[self.uid_field, 'new_id'])
-            i_df = pd.DataFrame(list(i_map.items()), columns=[self.iid_field, 'new_id'])
-            u_df.to_csv(os.path.join(self.preprocessed_dataset_path,
-                                     '{}_u_{}_mapping.csv'.format(self.dataset_name, self.ui_core_splitting_str)),
-                        sep=self.config['field_separator'], index=False)
-            i_df.to_csv(os.path.join(self.preprocessed_dataset_path,
-                                     '{}_i_{}_mapping.csv'.format(self.dataset_name, self.ui_core_splitting_str)),
-                        sep=self.config['field_separator'], index=False)
-            # 0-training/1-validation/2-test
-            for i, temp_df in enumerate(dfs):
-                temp_df[self.config['preprocessed_data_splitting']] = i
-            temp_df = pd.concat(dfs)
-            temp_df.to_csv(os.path.join(self.preprocessed_dataset_path, self.processed_data_name),
-                           sep=self.config['field_separator'], index=False)
-            self.logger.info('\nData saved to preprocessed dir: \n' + self.preprocessed_dataset_path)
-
-    # def _drop_cols(self, dfs, col_names):
-    #     for _df in dfs:
-    #         _df.drop(col_names, inplace=True, axis = 1)
-
-    def copy(self, new_df):
-        """Given a new interaction feature, return a new :class:`Dataset` object,
-                whose interaction feature is updated with ``new_df``, and all the other attributes the same.
-
-                Args:
-                    new_df (pandas.DataFrame): The new interaction feature need to be updated.
-
-                Returns:
-                    :class:`~Dataset`: the new :class:`~Dataset` object, whose interaction feature has been updated.
-                """
-        nxt = RecDataset(self.config, new_df)
-        return nxt
-
-    def num(self, field):
-        """Given ``field``, for token-like fields, return the number of different tokens after remapping,
-        for float-like fields, return ``1``.
-
-        Args:
-            field (str): field name to get token number.
-
-        Returns:
-            int: The number of different tokens (``1`` if ``field`` is a float-like field).
-        """
-        if field not in self.config['load_cols']:
-            raise ValueError('field [{}] not defined in dataset'.format(field))
-        uni_len = len(pd.unique(self.df[field]))
-        return uni_len
-
-    def shuffle(self):
-        """Shuffle the interaction records inplace.
-        """
-        self.df = self.df.sample(frac=1, replace=False).reset_index(drop=True)
-
-    def sort_by_chronological(self):
-        self.df.sort_values(by=[self.ts_id], inplace=True, ignore_index=True)
+        pass
 
     def __len__(self):
-        return len(self.df)
+        return math.ceil(self.pr_end / self.step)
 
-    def __getitem__(self, idx):
-        # Series result
-        return self.df.iloc[idx]
+    def __iter__(self):
+        if self.shuffle:
+            self._shuffle()
+        return self
 
-    def __repr__(self):
-        return self.__str__()
+    def __next__(self):
+        if self.pr >= self.pr_end:
+            self.pr = 0
+            self.inter_pr = 0
+            raise StopIteration()
+        return self._next_batch_data()
 
-    def __str__(self):
-        info = [self.dataset_name]
-        self.inter_num = len(self.df)
-        uni_u = pd.unique(self.df[self.uid_field])
-        uni_i = pd.unique(self.df[self.iid_field])
-        if self.uid_field:
-            self.user_num = len(uni_u)
-            self.avg_actions_of_users = self.inter_num/self.user_num
-            info.extend(['The number of users: {}'.format(self.user_num),
-                         'Average actions of users: {}'.format(self.avg_actions_of_users)])
-        if self.iid_field:
-            self.item_num = len(uni_i)
-            self.avg_actions_of_items = self.inter_num/self.item_num
-            info.extend(['The number of items: {}'.format(self.item_num),
-                         'Average actions of items: {}'.format(self.avg_actions_of_items)])
-        info.append('The number of inters: {}'.format(self.inter_num))
-        if self.uid_field and self.iid_field:
-            sparsity = 1 - self.inter_num / self.user_num / self.item_num
-            info.append('The sparsity of the dataset: {}%'.format(sparsity * 100))
-        return '\n'.join(info)
+    @property
+    def pr_end(self):
+        """This property marks the end of dataloader.pr which is used in :meth:`__next__()`."""
+        raise NotImplementedError('Method [pr_end] should be implemented')
+
+    def _shuffle(self):
+        """Shuffle the order of data, and it will be called by :meth:`__iter__()` if self.shuffle is True.
+        """
+        raise NotImplementedError('Method [shuffle] should be implemented.')
+
+    def _next_batch_data(self):
+        """Assemble next batch of data in form of Interaction, and return these data.
+
+        Returns:
+            Interaction: The next batch of data.
+        """
+        raise NotImplementedError('Method [next_batch_data] should be implemented.')
+
+
+class TrainDataLoader(AbstractDataLoader):
+    """
+    General dataloader with negative sampling.
+    """
+    def __init__(self, config, dataset, batch_size=1, shuffle=False):
+        super().__init__(config, dataset, additional_dataset=None,
+                         batch_size=batch_size, neg_sampling=True, shuffle=shuffle)
+
+        # special for training dataloader
+        self.history_items_per_u = dict()
+        # full items in training.
+        self.all_items = self.dataset.df[self.dataset.iid_field].unique().tolist()
+        self.all_uids = self.dataset.df[self.dataset.uid_field].unique()
+        self.all_item_len = len(self.all_items)
+        # if full sampling
+        self.use_full_sampling = config['use_full_sampling']
+
+        if config['use_neg_sampling']:
+            if self.use_full_sampling:
+                self.sample_func = self._get_full_uids_sample
+            else:
+                self.sample_func = self._get_neg_sample
+        else:
+            self.sample_func = self._get_non_neg_sample
+
+        self._get_history_items_u()
+
+    def pretrain_setup(self):
+        """
+        Reset dataloader. Outputing the same positive & negative samples with each training.
+        :return:
+        """
+        # self.pr & inter_pr already set to 0 in __next__(self)
+        # sort & random
+        if self.shuffle:
+            self.dataset = self.dataset_bk.copy(self.dataset_bk.df)
+        self.all_items.sort()
+        if self.use_full_sampling:
+            self.all_uids.sort()
+        random.shuffle(self.all_items)
+        # reorder dataset as default (chronological order)
+        #self.dataset.sort_by_chronological()
+
+    def inter_matrix(self, form='coo', value_field=None):
+        """Get sparse matrix that describe interactions between user_id and item_id.
+
+        Sparse matrix has shape (user_num, item_num).
+
+        For a row of <src, tgt>, ``matrix[src, tgt] = 1`` if ``value_field`` is ``None``,
+        else ``matrix[src, tgt] = self.inter_feat[src, tgt]``.
+
+        Args:
+            form (str, optional): Sparse matrix format. Defaults to ``coo``.
+            value_field (str, optional): Data of sparse matrix, which should exist in ``df_feat``.
+                Defaults to ``None``.
+
+        Returns:
+            scipy.sparse: Sparse matrix in form ``coo`` or ``csr``.
+        """
+        if not self.dataset.uid_field or not self.dataset.iid_field:
+            raise ValueError('dataset doesn\'t exist uid/iid, thus can not converted to sparse matrix')
+        return self._create_sparse_matrix(self.dataset.df, self.dataset.uid_field,
+                                          self.dataset.iid_field, form, value_field)
+
+    def _create_sparse_matrix(self, df_feat, source_field, target_field, form='coo', value_field=None):
+        """Get sparse matrix that describe relations between two fields.
+
+        Source and target should be token-like fields.
+
+        Sparse matrix has shape (``self.num(source_field)``, ``self.num(target_field)``).
+
+        For a row of <src, tgt>, ``matrix[src, tgt] = 1`` if ``value_field`` is ``None``,
+        else ``matrix[src, tgt] = df_feat[value_field][src, tgt]``.
+
+        Args:
+            df_feat (pandas.DataFrame): Feature where src and tgt exist.
+            source_field (str): Source field
+            target_field (str): Target field
+            form (str, optional): Sparse matrix format. Defaults to ``coo``.
+            value_field (str, optional): Data of sparse matrix, which should exist in ``df_feat``.
+                Defaults to ``None``.
+
+        Returns:
+            scipy.sparse: Sparse matrix in form ``coo`` or ``csr``.
+        """
+        src = df_feat[source_field].values
+        tgt = df_feat[target_field].values
+        if value_field is None:
+            data = np.ones(len(df_feat))
+        else:
+            if value_field not in df_feat.columns:
+                raise ValueError('value_field [{}] should be one of `df_feat`\'s features.'.format(value_field))
+            data = df_feat[value_field].values
+        mat = coo_matrix((data, (src, tgt)), shape=(self.dataset.num(source_field), self.dataset.num(target_field)))
+
+        if form == 'coo':
+            return mat
+        elif form == 'csr':
+            return mat.tocsr()
+        else:
+            raise NotImplementedError('sparse matrix format [{}] has not been implemented.'.format(form))
+
+    @property
+    def pr_end(self):
+        if self.use_full_sampling:
+            return len(self.all_uids)
+        return len(self.dataset)
+
+    def _shuffle(self):
+        self.dataset.shuffle()
+        if self.use_full_sampling:
+            np.random.shuffle(self.all_uids)
+
+    def _next_batch_data(self):
+        return self.sample_func()
+
+    def _get_neg_sample(self):
+        cur_data = self.dataset[self.pr: self.pr + self.step]
+        self.pr += self.step
+        # to tensor
+        user_tensor = torch.tensor(cur_data[self.config['USER_ID_FIELD']].values).type(torch.LongTensor).to(self.device)
+        item_tensor = torch.tensor(cur_data[self.config['ITEM_ID_FIELD']].values).type(torch.LongTensor).to(self.device)
+        batch_tensor = torch.cat((torch.unsqueeze(user_tensor, 0),
+                                  torch.unsqueeze(item_tensor, 0)))
+        u_ids = cur_data[self.config['USER_ID_FIELD']]
+        # sampling negative items only in the dataset (train)
+        neg_ids = self._sample_neg_ids(u_ids).to(self.device)
+        # merge negative samples
+        batch_tensor = torch.cat((batch_tensor, neg_ids.unsqueeze(0)))
+        return batch_tensor
+
+    def _get_non_neg_sample(self):
+        cur_data = self.dataset[self.pr: self.pr + self.step]
+        self.pr += self.step
+        # to tensor
+        user_tensor = torch.tensor(cur_data[self.config['USER_ID_FIELD']].values).type(torch.LongTensor).to(self.device)
+        item_tensor = torch.tensor(cur_data[self.config['ITEM_ID_FIELD']].values).type(torch.LongTensor).to(self.device)
+        batch_tensor = torch.cat((torch.unsqueeze(user_tensor, 0),
+                                  torch.unsqueeze(item_tensor, 0)))
+        return batch_tensor
+
+    def _get_full_uids_sample(self):
+        user_tensor = torch.tensor(self.all_uids[self.pr: self.pr + self.step]).type(torch.LongTensor).to(self.device)
+        self.pr += self.step
+        return user_tensor
+
+    def _sample_neg_ids(self, u_ids):
+        neg_ids = []
+        for u in u_ids:
+            # random 1 item
+            iid = self._random()
+            while iid in self.history_items_per_u[u]:
+                iid = self._random()
+            neg_ids.append(iid)
+        return torch.tensor(neg_ids).type(torch.LongTensor)
+
+    def _random(self):
+        #self.neg_pr = (self.neg_pr + 1 + random.getrandbits(6)) % self.all_item_len
+        #return self.all_items[self.neg_pr]
+        # updated to normal random method:
+        rd_id = random.sample(self.all_items, 1)[0]
+        return rd_id
+
+    def _get_history_items_u(self):
+        uid_field = self.dataset.uid_field
+        iid_field = self.dataset.iid_field
+        # load avail items for all uid
+        uid_freq = self.dataset.df.groupby(uid_field)[iid_field]
+        for u, u_ls in uid_freq:
+            self.history_items_per_u[u] = u_ls.values
+        return self.history_items_per_u
+
+
+class EvalDataLoader(AbstractDataLoader):
+    """
+        additional_dataset: training dataset in evaluation
+    """
+    def __init__(self, config, dataset, additional_dataset=None,
+                 batch_size=1, shuffle=False):
+        super().__init__(config, dataset, additional_dataset=additional_dataset,
+                         batch_size=batch_size, neg_sampling=False, shuffle=shuffle)
+
+        if additional_dataset is None:
+            raise ValueError('Training datasets is nan')
+        self.eval_items_per_u = []
+        self.eval_len_list = []
+        self.train_pos_len_list = []
+
+        self.eval_u = self.dataset.df[self.dataset.uid_field].unique()
+        # special for eval dataloader
+        self.pos_items_per_u = self._get_pos_items_per_u(self.eval_u).to(self.device)
+        self._get_eval_items_per_u(self.eval_u)
+        # to device
+        self.eval_u = torch.tensor(self.eval_u).type(torch.LongTensor).to(self.device)
+
+    @property
+    def pr_end(self):
+        return self.eval_u.shape[0]
+
+    def _shuffle(self):
+        self.dataset.shuffle()
+
+    def _next_batch_data(self):
+        inter_cnt = sum(self.train_pos_len_list[self.pr: self.pr+self.step])
+        batch_users = self.eval_u[self.pr: self.pr + self.step]
+        batch_mask_matrix = self.pos_items_per_u[:, self.inter_pr: self.inter_pr+inter_cnt].clone()
+        # user_ids to index
+        batch_mask_matrix[0] -= self.pr
+        self.inter_pr += inter_cnt
+        self.pr += self.step
+
+        return [batch_users, batch_mask_matrix]
+
+    def _get_pos_items_per_u(self, eval_users):
+        """
+        history items in training dataset.
+        masking out positive items in evaluation
+        :return:
+        user_id - item_ids matrix
+        [[0, 0, ... , 1, ...],
+         [0, 1, ... , 0, ...]]
+        """
+        uid_field = self.additional_dataset.uid_field
+        iid_field = self.additional_dataset.iid_field
+        # load avail items for all uid
+        uid_freq = self.additional_dataset.df.groupby(uid_field)[iid_field]
+        u_ids = []
+        i_ids = []
+        for i, u in enumerate(eval_users):
+            u_ls = uid_freq.get_group(u).values
+            i_len = len(u_ls)
+            self.train_pos_len_list.append(i_len)
+            u_ids.extend([i]*i_len)
+            i_ids.extend(u_ls)
+        return torch.tensor([u_ids, i_ids]).type(torch.LongTensor)
+
+    def _get_eval_items_per_u(self, eval_users):
+        """
+        get evaluated items for each u
+        :return:
+        """
+        uid_field = self.dataset.uid_field
+        iid_field = self.dataset.iid_field
+        # load avail items for all uid
+        uid_freq = self.dataset.df.groupby(uid_field)[iid_field]
+        for u in eval_users:
+            u_ls = uid_freq.get_group(u).values
+            self.eval_len_list.append(len(u_ls))
+            self.eval_items_per_u.append(u_ls)
+        self.eval_len_list = np.asarray(self.eval_len_list)
+
+    # return pos_items for each u
+    def get_eval_items(self):
+        return self.eval_items_per_u
+
+    def get_eval_len_list(self):
+        return self.eval_len_list
+
+    def get_eval_users(self):
+        return self.eval_u.cpu()
+
+
