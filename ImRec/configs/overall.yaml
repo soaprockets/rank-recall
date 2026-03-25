@@ -3,6 +3,7 @@ gpu_id: [0,1]
 use_gpu: True
 seed: [999]
 data_path: 'data/'
+emb_path: 'inter_embs/'
 preprocessed_data: 'preprocessed_data/'
 preprocessed_data_splitting: 'x_label'
 load_preprocessed: True
