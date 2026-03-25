@@ -8,6 +8,7 @@ import os
 import itertools
 import torch
 import torch.optim as optim
+import torch.nn.functional as F
 from torch.nn.utils.clip_grad import clip_grad_norm_
 import numpy as np
 import matplotlib.pyplot as plt
@@ -465,6 +466,11 @@ class Trainer(AbstractTrainer):
                 self.logger.warning("Falling back to raw embedding layer (layer 0)")
                 user_all_embeddings = self.model.user_embedding.weight
                 item_all_embeddings = self.model.item_embedding.weight
+
+            # 添加L2归一化处理
+            user_all_embeddings = F.normalize(user_all_embeddings, p=2, dim=1)
+            item_all_embeddings = F.normalize(item_all_embeddings, p=2, dim=1)
+            self.logger.info("Applied L2 normalization to user and item embeddings")
 
             # 验证 embedding 和 ID 映射的正确性
             self._validate_embedding_mapping(
