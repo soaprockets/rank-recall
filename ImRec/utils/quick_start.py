@@ -106,10 +106,12 @@ def quick_start(model, dataset, config_dict, save_model=True):
                                      '{}_u_{}_mapping.csv'.format(dataset.dataset_name, dataset.ui_core_splitting_str))
         item_dict_path = os.path.join(dataset.preprocessed_dataset_path,
                                      '{}_i_{}_mapping.csv'.format(dataset.dataset_name, dataset.ui_core_splitting_str))
-        save_path = ' ./ImRec/inter_embs'
+        emb_path = config['emb_path']
+        if not os.path.exists(emb_path):
+            os.makedirs(emb_path)
         user_dict = load_csv_to_dict(user_dict_path)
         item_dict = load_csv_to_dict(item_dict_path)
-        trainer.save_all_embedding(user_dict,item_dict,load_best_model=save_model,save_path=save_path,idx=idx)
+        trainer.save_all_embedding(user_dict,item_dict,load_best_model=save_model,save_path=emb_path,idx=idx)
 
 
         # save best test
